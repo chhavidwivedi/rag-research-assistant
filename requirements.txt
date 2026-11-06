@@ -1,0 +1,5 @@
+faiss-cpu
+pypdf
+sentence-transformers<6
+streamlit
+transformers<5
