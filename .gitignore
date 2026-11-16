@@ -1,6 +1,12 @@
 .venv/
 __pycache__/
 *.py[cod]
-vector_store/
 .env
+.DS_Store
+
+# Backup files
+*_backup*
+vector_store_backup_before_chunking/
+
+# Uploaded research PDFs
 data/documents/*.pdf

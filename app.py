@@ -1,189 +1,194 @@
-import json
-import subprocess
-import sys
-from pathlib import Path
 
-import faiss
 import streamlit as st
-from sentence_transformers import CrossEncoder, SentenceTransformer
-from transformers import pipeline
 
-
-st.set_page_config(page_title="Research Assistant")
-st.title("RAG Research Assistant")
-st.write("Ask a question about the research paper.")
-
-st.session_state.setdefault("messages", [])
-if st.button("Clear conversation"):
-    st.session_state.messages.clear()
-    st.rerun()
-
-uploaded_files = st.file_uploader(
-    "Choose research PDFs",
-    type=["pdf"],
-    accept_multiple_files=True,
+from search import load_search_resources, search_papers
+from answer_extractive import (
+    generate_extractive_answer,
+    INSUFFICIENT_EVIDENCE
 )
 
-if uploaded_files and st.button("Save PDFs and rebuild index"):
-    documents_folder = Path("data/documents")
-    documents_folder.mkdir(parents=True, exist_ok=True)
 
-    saved_names = []
+# ----------------------------------
+# PAGE CONFIGURATION
+# ----------------------------------
 
-    with st.spinner("Saving PDFs and rebuilding the search index..."):
-        for uploaded_file in uploaded_files:
-            safe_name = Path(uploaded_file.name).name
-            destination = documents_folder / safe_name
-            destination.write_bytes(uploaded_file.getvalue())
-            saved_names.append(safe_name)
+st.set_page_config(
+    page_title="RAG Research Assistant",
+    page_icon="📚",
+    layout="wide"
+)
 
-        build_result = subprocess.run(
-            [sys.executable, "build_index.py"],
-            cwd=Path(__file__).resolve().parent,
-            capture_output=True,
-            text=True,
-        )
+st.title("📚 RAG Research Assistant")
 
-    if build_result.returncode != 0:
-        st.error("The index could not be rebuilt.")
-        st.code(build_result.stderr or build_result.stdout)
-    else:
-        st.cache_resource.clear()
-        st.success(
-            f"Saved and indexed {len(saved_names)} PDF(s): "
-            f"{', '.join(saved_names)}"
-        )
+st.markdown(
+    """
+    Ask questions about research papers and receive
+    evidence-based answers with paper and page citations.
 
+    This application uses semantic retrieval, CrossEncoder
+    reranking, and extractive answer generation.
+    """
+)
+
+st.divider()
+
+
+# ----------------------------------
+# LOAD RESOURCES
+# ----------------------------------
 
 @st.cache_resource
-def load_resources():
-    embedder = SentenceTransformer(
-        "sentence-transformers/all-MiniLM-L6-v2"
-    )
-    reranker = CrossEncoder(
-        "cross-encoder/ms-marco-MiniLM-L-6-v2"
-    )
-    index = faiss.read_index("vector_store/research.index")
+def get_resources():
+    return load_search_resources()
 
-    with Path("vector_store/chunks.json").open(
-        "r", encoding="utf-8"
-    ) as file:
-        chunks = json.load(file)
 
-    answer_model = pipeline(
-        "text-generation",
-        model="Qwen/Qwen2.5-0.5B-Instruct",
+# ----------------------------------
+# SESSION STATE
+# ----------------------------------
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+
+# ----------------------------------
+# SIDEBAR
+# ----------------------------------
+
+with st.sidebar:
+
+    st.header("About the project")
+
+    st.write(
+        """
+        This research assistant uses:
+
+        - Sentence Transformers for embeddings
+        - FAISS for vector similarity search
+        - CrossEncoder for reranking
+        - Extractive answer generation
+        """
     )
 
-    return embedder, reranker, index, chunks, answer_model
+    st.divider()
+
+    if st.button("Clear conversation", use_container_width=True):
+        st.session_state.messages = []
+        st.rerun()
+
+
+# ----------------------------------
+# DISPLAY PREVIOUS MESSAGES
+# ----------------------------------
 
 for message in st.session_state.messages:
+
     with st.chat_message(message["role"]):
-        st.write(message["content"])
-question = st.chat_input("Ask a question about your papers")
+        st.markdown(message["content"])
+
+
+# ----------------------------------
+# USER INPUT
+# ----------------------------------
+
+question = st.chat_input(
+    "Ask a question about your research papers..."
+)
+
+
+# ----------------------------------
+# PROCESS QUESTION
+# ----------------------------------
 
 if question:
+
     st.session_state.messages.append({
         "role": "user",
-        "content": question,
+        "content": question
     })
 
     with st.chat_message("user"):
-        st.write(question)
+        st.markdown(question)
 
     with st.chat_message("assistant"):
-        with st.spinner("Searching the papers and preparing an answer..."):
-            embedder, reranker, index, chunks, answer_model = load_resources()
 
-            question_vector = embedder.encode(
-                [question],
-                convert_to_numpy=True,
-                normalize_embeddings=True,
-            ).astype("float32")
+        try:
 
-            candidate_count = min(10, index.ntotal)
-            _, candidate_ids = index.search(
-                question_vector,
-                candidate_count,
-            )
-
-            candidates = [
-                chunks[int(chunk_id)]
-                for chunk_id in candidate_ids[0]
-                if chunk_id >= 0
-            ]
-
-            rerank_scores = reranker.predict(
-                [(question, chunk["text"]) for chunk in candidates]
-            )
-
-            ranked_results = sorted(
-                zip(candidates, rerank_scores),
-                key=lambda item: float(item[1]),
-                reverse=True,
-            )[:3]
-
-            results = [
-                (chunk, float(score))
-                for chunk, score in ranked_results
-            ]
-
-            if results and results[0][1] >= 0:
-                context = "\n\n".join(
-                    f"[Source: {chunk['source']}, page {chunk['page']}]\n"
-                    f"{chunk['text'][:1000]}"
-                    for chunk, _score in results[:2]
-                )
-
-                llm_messages = [
-                    {
-                        "role": "system",
-                        "content": (
-                            "Use only the supplied paper excerpts. For list "
-                            "questions, give only the exact names explicitly "
-                            "listed in the excerpts; do not add descriptions. "
-                            "If the excerpts do not contain the answer, say so."
-                        ),
-                    },
-                    {
-                        "role": "user",
-                        "content": (
-                            f"Question: {question}\n\n"
-                            f"Paper excerpts:\n{context}"
-                        ),
-                    },
-                ]
-
-                generated = answer_model(
-                    llm_messages,
-                    max_new_tokens=160,
-                    do_sample=False,
-                )
-
-                answer = generated[0]["generated_text"][-1]["content"]
-
-                source_chunk = results[0][0]
-                answer += (
-                    f"\n\nSource: {source_chunk['source']}, "
-                    f"page {source_chunk['page']}"
-                )
-            else:
-                answer = (
-                    "I couldn't find relevant evidence for this question "
-                    "in the papers."
-                )
-
-        st.write(answer)
-
-        st.markdown("**Retrieved passages**")
-        for chunk, score in results:
-            with st.expander(
-                f"{chunk['source']} — page {chunk['page']} "
-                f"(rerank score: {score:.2f})"
+            with st.spinner(
+                "Searching research papers and preparing your answer..."
             ):
-                st.write(chunk["text"])
 
-    st.session_state.messages.append({
-        "role": "assistant",
-        "content": answer,
-    })
+                # Load models and FAISS index.
+                embedder, reranker, index, chunks = get_resources()
+
+                # Retrieve and rerank relevant passages.
+                results = search_papers(
+                    question,
+                    embedder,
+                    reranker,
+                    index,
+                    chunks
+                )
+
+                # Generate extractive answer.
+                answer = generate_extractive_answer(
+                    question,
+                    results
+                )
+
+            # ----------------------------------
+            # DISPLAY ANSWER
+            # ----------------------------------
+
+            st.markdown("### Answer")
+
+            st.markdown(answer)
+
+            # ----------------------------------
+            # DISPLAY RETRIEVED EVIDENCE
+            # ----------------------------------
+
+            if answer != INSUFFICIENT_EVIDENCE and results:
+
+                st.markdown("### Supporting evidence")
+
+                for i, result in enumerate(results, start=1):
+
+                    chunk = result["chunk"]
+
+                    score = result.get(
+                        "rerank_score",
+                        "Not available"
+                    )
+
+                    with st.expander(
+                        f"{i}. {chunk['source']} — "
+                        f"Page {chunk['page']} "
+                        f"(Reranker score: {score})"
+                    ):
+
+                        st.write(chunk["text"])
+
+            else:
+
+                st.info(
+                    "No sufficiently relevant evidence was found "
+                    "in the uploaded research papers."
+                )
+
+            # ----------------------------------
+            # SAVE ASSISTANT RESPONSE
+            # ----------------------------------
+
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": answer
+            })
+
+        except Exception as error:
+
+            st.error(
+                "Something went wrong while processing your question."
+            )
+
+            with st.expander("Technical error details"):
+                st.exception(error)
